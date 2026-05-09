@@ -79,6 +79,8 @@
 volatile uint8_t robot_mode  = 2;   // 0 = Standby, 1 = Diagnostic , 2 = Autonomous
 volatile int     node_count  = 0;   // Nodes detected during autonomous run
 volatile int     last_node   = -1;  // Debounce: ignore re-triggers on same node
+volatile uint8_t junction_lock = 0;
+volatile uint8_t junction_count = 0;
 
 volatile int case1_change_counter = 0;
 float Version = 3.1;
@@ -211,92 +213,85 @@ uint8_t is_blue_slot(void) {
 //  LINE FOLLOWING WITH LINE-LOSS RECOVERY
 // ============================================================
 
-volatile int8_t last_error = 0;
 // -2 = far left
 // -1 = left
 //  0 = centered
 // +1 = right
 // +2 = far right
 
+volatile int8_t last_error = 0;
+
 void line_follow(void) {
 
-    // ACTIVE LOW SENSORS
-    // 0 = BLACK LINE DETECTED
-    // invert them so:
-    // 1 = line detected
+    // ACTIVE LOW -> invert
     uint8_t s1 = !S_FAR_LEFT;
     uint8_t s2 = !S_LEFT;
     uint8_t s3 = !S_CENTER;
     uint8_t s4 = !S_RIGHT;
     uint8_t s5 = !S_FAR_RIGHT;
 
-    // --------------------------------------------------------
-    // CENTERED
-    // --------------------------------------------------------
+    // CENTER
     if (s3) {
         forward();
+        __delay_ms(5);
         last_error = 0;
-        __delay_ms(10);
     }
 
-    // --------------------------------------------------------
     // SLIGHT LEFT
-    // --------------------------------------------------------
-    else if (s2) {
+    else if (s2 && !s1) {
         soft_left();
+        __delay_ms(5);
+
+        forward();
+        __delay_ms(2);
+
         last_error = -1;
-         __delay_ms(8);
     }
 
-    // --------------------------------------------------------
     // SLIGHT RIGHT
-    // --------------------------------------------------------
-    else if (s4) {
+    else if (s4 && !s5) {
         soft_right();
+        __delay_ms(5);
+
+        forward();
+        __delay_ms(2);
+
         last_error = 1;
-         __delay_ms(8);
     }
 
-    // --------------------------------------------------------
-    // FAR LEFT
-    // --------------------------------------------------------
+    // HARD LEFT
     else if (s1) {
         hard_left();
+        __delay_ms(8);
+
         last_error = -2;
-         __delay_ms(12);
     }
 
-    // --------------------------------------------------------
-    // FAR RIGHT
-    // --------------------------------------------------------
+    // HARD RIGHT
     else if (s5) {
         hard_right();
+        __delay_ms(8);
+
         last_error = 2;
-         __delay_ms(12);
     }
 
-    // --------------------------------------------------------
     // LINE LOST
-    // --------------------------------------------------------
     else {
 
-        // Recover using last known direction
-
         if (last_error < 0) {
-            // Last seen on left
             hard_left();
+            __delay_ms(5);
         }
         else if (last_error > 0) {
-            // Last seen on right
             hard_right();
+            __delay_ms(5);
         }
         else {
-            // Unknown position
             forward();
+            __delay_ms(5);
         }
     }
 }
-
 void align_on_node(void) {
     // Move forward slightly to center robot
     forward();
@@ -356,6 +351,28 @@ void motor_init_safe(void) {
     CCPR2L = 0;
 
     __delay_ms(50);
+}
+
+uint8_t detect_junction(void) {
+
+    uint8_t s1 = !S_FAR_LEFT;
+    uint8_t s2 = !S_LEFT;
+    uint8_t s3 = !S_CENTER;
+    uint8_t s4 = !S_RIGHT;
+    uint8_t s5 = !S_FAR_RIGHT;
+
+    // Detect wide intersection
+    if (
+        (s1 && s2 && s3) ||
+        (s3 && s4 && s5) ||
+        (s2 && s3 && s4) ||
+        (s1 && s5)
+       )
+    {
+        return 1;
+    }
+
+    return 0;
 }
 
 // ============================================================
@@ -524,20 +541,53 @@ void main(void) {
                 LED_SYS_OK = 0; LED_BUSY = 0; LED_ERROR = 1;
                 
                 
-                //Sonar sensor code
-                uint16_t dist = sonar_read_cm();
+//                //Sonar sensor code
+//                uint16_t dist = sonar_read_cm();
+//                
+//                if (dist > 0 && dist < Sonar_Distance) {   // obstacle within 15 cm
+//                    stop();
+//
+//                    // Simple avoidance behavior
+//                    hard_left();
+//                    __delay_ms(400);
+//
+//                    forward();
+//                    __delay_ms(200);
+//
+//                        break;  // skip rest of loop
+//                }                
                 
-                if (dist > 0 && dist < Sonar_Distance) {   // obstacle within 15 cm
-                    stop();
+                // ------------------------------------------------
+                // JUNCTION DETECTION
+                // ------------------------------------------------
+                if (detect_junction()) {
 
-                    // Simple avoidance behavior
-                    hard_left();
-                    __delay_ms(400);
+                    if (!junction_lock) {
 
-                    forward();
-                    __delay_ms(200);
+                        junction_count++;
+                        junction_lock = 1;
 
-                        break;  // skip rest of loop
+                        // small forward settle
+                        forward();
+                        __delay_ms(200);
+
+                        // THIRD JUNCTION -> TURN
+                        if (junction_count == 3) {
+
+                            hard_right();
+
+                            // turn until center reacquires line
+                            while (S_CENTER) {
+                                __delay_ms(1);
+                            }
+
+                            forward();
+                            __delay_ms(100);
+                        }
+                    }
+                }
+                else {
+                    junction_lock = 0;
                 }                
                 
                 line_follow();
