@@ -1,0 +1,548 @@
+/*
+ * PROJECT: NERC/CEP 2026 Autonomous Robot
+ * VERSION: 3.0 (Integration Build)
+ * AUTHOR: Yazdan Ali Khan (2024665)
+ * TARGET: PIC18F4550 @ 8MHz
+ *
+ * ARCHITECTURE: Interrupt-driven state machine (main.c v2.0 philosophy)
+ * AUTONOMOUS LOGIC: Node-based navigation with colour-sorted pallet deployment
+ */
+
+// Configuration Bits
+#pragma config FOSC   = INTOSC_HS
+#pragma config PLLDIV = 1
+#pragma config CPUDIV = OSC1_PLL2
+#pragma config USBDIV = 1
+#pragma config FCMEN  = OFF
+#pragma config IESO   = OFF
+#pragma config PWRT   = OFF
+#pragma config BOR    = OFF
+#pragma config VREGEN = OFF
+#pragma config WDT    = OFF
+#pragma config WDTPS  = 32768
+#pragma config CCP2MX = ON
+#pragma config PBADEN = OFF
+#pragma config LPT1OSC= OFF
+#pragma config MCLRE  = ON
+#pragma config STVREN = OFF
+#pragma config LVP    = OFF
+#pragma config ICPRT  = OFF
+#pragma config XINST  = OFF
+
+#include <xc.h>
+#include <stdint.h>
+
+#define _XTAL_FREQ 8000000
+
+// ============================================================
+//  PIN ARCHITECTURE
+// ============================================================
+
+// -- Diagnostics / Mode LEDs --
+#define LED_SYS_OK      LATDbits.LATD0  // Green  : Mode 0 ? Standby Mode LED
+#define LED_BUSY        LATDbits.LATD1  // White  : Mode 1 ? Debug Mode LED
+#define LED_ERROR       LATDbits.LATD2  // Red(Also White) : Mode 2 ? Fully Autonomous  Mode LED
+
+// -- Motor Driver (L298N / L293D) --
+#define MOTOR_LEFT_F    LATDbits.LATD4  // IN1
+#define MOTOR_LEFT_B    LATDbits.LATD5  // IN2
+#define MOTOR_RIGHT_F   LATDbits.LATD6  // IN3
+#define MOTOR_RIGHT_B   LATDbits.LATD7  // IN4
+
+// -- Servo (Pallet Deployment) --
+#define SERVO_PWM       LATBbits.LATB3  // CCP2 / software PWM
+
+// -- Colour Sensor (TCS3200 or single digital output) --
+//    Convention: COLOR_IN == 1 ? BLUE slot, 0 ? RED slot
+#define COLOR_S2        LATBbits.LATB4
+#define COLOR_S3        LATBbits.LATB1
+#define COLOR_IN        PORTBbits.RB2
+
+// -- Line Sensors (Active Low: 0 = Black Line detected) --
+#define SENSORS_PORT    PORTA
+#define S_FAR_LEFT      PORTAbits.RA0   // S1
+#define S_LEFT          PORTAbits.RA1   // S2
+#define S_CENTER        PORTAbits.RA2   // S3
+#define S_RIGHT         PORTAbits.RA3   // S4
+#define S_FAR_RIGHT     PORTAbits.RA5   // S5
+
+// -- Ultrasonic Sensor (HC-SR04) --
+#define SONAR_TRIG LATCbits.LATC0
+#define SONAR_ECHO  PORTBbits.RB5
+
+// -- Push-Button (Mode Cycle) --
+// RB0 / INT0 ? external pull-up required
+
+// ============================================================
+//  GLOBAL STATE
+// ============================================================
+volatile uint8_t robot_mode  = 2;   // 0 = Standby, 1 = Diagnostic , 2 = Autonomous
+volatile int     node_count  = 0;   // Nodes detected during autonomous run
+volatile int     last_node   = -1;  // Debounce: ignore re-triggers on same node
+
+volatile int case1_change_counter = 0;
+float Version = 3.1;
+int Sonar_Distance = 5;
+
+// ============================================================
+//  SPEED SETTING  <-- only value you need to tune (0-255)
+// ============================================================
+//  255 = full speed
+//  180 = ~70% speed  (good starting point for line following)
+//  128 = 50% speed
+//  80  = ~30% speed  (very slow, use if still overshooting)
+#define MOTOR_SPEED     180
+
+// ============================================================
+//  PWM INITIALISATION
+// ============================================================
+/*
+ * Timer2 drives both CCP1 and CCP2.
+ * PR2 = 199, prescaler = 4 → ~2.5 kHz PWM frequency.
+ * Duty cycle set via CCPR1L/CCPR2L (0-255 maps to 0-100%).
+ */
+void pwm_init(void) {
+    // 1. Set CCP pins as outputs
+    TRISCbits.TRISC2 = 0;   // CCP1 output
+    TRISCbits.TRISC1 = 0;   // CCP2 output
+ 
+    // 2. Set PWM period via PR2
+    PR2 = 199;
+ 
+    // 3. Configure CCP1 in PWM mode
+    CCP1CON = 0x0C;         // PWM mode, LSBs of duty = 00
+ 
+    // 4. Configure CCP2 in PWM mode
+    CCP2CON = 0x0C;
+ 
+    // 5. Set initial duty cycle (both motors same speed)
+    CCPR1L = MOTOR_SPEED;
+    CCPR2L = MOTOR_SPEED;
+ 
+    // 6. Start Timer2 (prescaler = 4)
+    T2CON = 0x05;           // Timer2 ON, prescaler = 4
+}
+
+/* Software PWM pulse ? generates one servo pulse of 'us' microseconds */
+static void _servo_pulse(uint16_t us) {
+    SERVO_PWM = 1;
+    // XC8 __delay_us() requires a compile-time constant; use a loop instead
+    while (us--) { __delay_us(1); }
+    SERVO_PWM = 0;
+}
+
+/* Move servo to angle (0?180°) by sending ~40 pulses @ 20 ms period */
+void set_servo_angle(uint8_t angle) {
+    uint16_t pulse_us = 1000u + ((uint16_t)angle * 1000u / 180u);
+    for (uint8_t i = 0; i < 40; i++) {
+        _servo_pulse(pulse_us);
+        __delay_ms(20);
+    }
+}
+
+// ============================================================
+//  MOTOR CONTROL  (raw pin set)
+// ============================================================
+
+//  SPEED CONTROL  (call anytime to change speed on the fly)
+void set_speed(uint8_t left, uint8_t right) {
+    CCPR2L = left;          // CCP2 / RC1 = left motor
+    CCPR1L = right;         // CCP1 / RC2 = right motor
+}
+
+void drive(int8_t left, int8_t right) {
+    MOTOR_LEFT_F  = (left  > 0);
+    MOTOR_LEFT_B  = (left  < 0);
+    MOTOR_RIGHT_F = (right > 0);
+    MOTOR_RIGHT_B = (right < 0);
+}
+ 
+static void forward(void)    { set_speed(MOTOR_SPEED, MOTOR_SPEED); drive( 1,  1); }
+static void stop(void)       { set_speed(0, 0);                     drive( 0,  0); }
+static void soft_left(void)  { set_speed(0, MOTOR_SPEED);           drive( 0,  1); }
+static void soft_right(void) { set_speed(MOTOR_SPEED, 0);           drive( 1,  0); }
+static void hard_left(void)  { set_speed(MOTOR_SPEED, MOTOR_SPEED); drive(-1,  1); }
+static void hard_right(void) { set_speed(MOTOR_SPEED, MOTOR_SPEED); drive( 1, -1); }
+
+// ============================================================
+//  SELF-DIAGNOSTIC (Power-On Self Test)
+/* Tests All 3 LEDs to see if they are responsive when first startup 
+ * Tests Servo Motors and range
+ * Check if IR Sesnors are operational
+ */
+void run_power_on_self_test(void) {
+    // 1. LED Chase ? confirms all three LEDs are functional
+    LED_SYS_OK = 1; __delay_ms(300);
+    LED_BUSY   = 1; __delay_ms(200);
+    LED_ERROR  = 1; __delay_ms(200);
+    
+    LATD &= 0b00000111;   // Clear only LED bits (D0-D2), preserve motor bits
+
+    // 2. Servo Range Test
+    set_servo_angle(0);
+    __delay_ms(300);
+    set_servo_angle(90);
+    __delay_ms(300);
+    set_servo_angle(0);
+
+    // 3. Sensor Bus Check ? all lines read high (open circuit / no sensors) light up Green LED
+    if (SENSORS_PORT == 0xFF) {
+        LED_ERROR = 1;  // Amber + Red = sensor fault; operator must inspect
+    }
+}
+
+// ============================================================
+//  COLOUR DETECTION
+// ============================================================
+/*
+ * Returns 1 if the sensor reports BLUE, 0 if RED (or unknown).
+ * The TCS3200 S2=0/S3=1 selects the blue photo-diode filter.
+ * A full implementation would measure output frequency via timer;
+ * here we read the raw digital output after a settle delay.
+ */
+uint8_t is_blue_slot(void) {
+    COLOR_S2 = 0;
+    COLOR_S3 = 1;
+    __delay_ms(15);         // Allow TCS3200 output to settle
+    return COLOR_IN;        // 1 = Blue frequency dominant
+}
+
+// ============================================================
+//  LINE FOLLOWING WITH LINE-LOSS RECOVERY
+// ============================================================
+
+volatile int8_t last_error = 0;
+// -2 = far left
+// -1 = left
+//  0 = centered
+// +1 = right
+// +2 = far right
+
+void line_follow(void) {
+
+    // ACTIVE LOW SENSORS
+    // 0 = BLACK LINE DETECTED
+    // invert them so:
+    // 1 = line detected
+    uint8_t s1 = !S_FAR_LEFT;
+    uint8_t s2 = !S_LEFT;
+    uint8_t s3 = !S_CENTER;
+    uint8_t s4 = !S_RIGHT;
+    uint8_t s5 = !S_FAR_RIGHT;
+
+    // --------------------------------------------------------
+    // CENTERED
+    // --------------------------------------------------------
+    if (s3) {
+        forward();
+        last_error = 0;
+        __delay_ms(10);
+    }
+
+    // --------------------------------------------------------
+    // SLIGHT LEFT
+    // --------------------------------------------------------
+    else if (s2) {
+        soft_left();
+        last_error = -1;
+         __delay_ms(8);
+    }
+
+    // --------------------------------------------------------
+    // SLIGHT RIGHT
+    // --------------------------------------------------------
+    else if (s4) {
+        soft_right();
+        last_error = 1;
+         __delay_ms(8);
+    }
+
+    // --------------------------------------------------------
+    // FAR LEFT
+    // --------------------------------------------------------
+    else if (s1) {
+        hard_left();
+        last_error = -2;
+         __delay_ms(12);
+    }
+
+    // --------------------------------------------------------
+    // FAR RIGHT
+    // --------------------------------------------------------
+    else if (s5) {
+        hard_right();
+        last_error = 2;
+         __delay_ms(12);
+    }
+
+    // --------------------------------------------------------
+    // LINE LOST
+    // --------------------------------------------------------
+    else {
+
+        // Recover using last known direction
+
+        if (last_error < 0) {
+            // Last seen on left
+            hard_left();
+        }
+        else if (last_error > 0) {
+            // Last seen on right
+            hard_right();
+        }
+        else {
+            // Unknown position
+            forward();
+        }
+    }
+}
+
+void align_on_node(void) {
+    // Move forward slightly to center robot
+    forward();
+    __delay_ms(150);
+    stop();
+}
+
+// ============================================================
+//  PALLET DEPLOYMENT  (color-sorted)
+// ============================================================
+void demo_placement(void) {
+    stop();
+    __delay_ms(200);
+
+    if (is_blue_slot()) {
+        // BLUE slot ? full drop (90°)
+        set_servo_angle(90);
+        LED_SYS_OK = 1; LED_BUSY = 0;
+    } else {
+        // RED slot ? reject / partial swing (45°)
+        set_servo_angle(45);
+        LED_SYS_OK = 0; LED_BUSY = 1;
+    }
+
+    __delay_ms(400);
+    set_servo_angle(0);     // Return arm to home
+    __delay_ms(300);
+
+    LED_SYS_OK = 0; LED_BUSY = 0;
+}
+
+// ============================================================
+//  TIMED TURN HELPERS
+// ============================================================
+void turn_right(void) {
+    hard_right();
+    while (S_CENTER) { }   // wait until line reacquired
+    stop();
+}
+
+void turn_left(void) {
+    hard_left();
+    while (S_CENTER) { }   // wait until line reacquired
+    stop();
+}
+
+void motor_init_safe(void) {
+
+    // Directions OFF
+    MOTOR_LEFT_F  = 0;
+    MOTOR_LEFT_B  = 0;
+    MOTOR_RIGHT_F = 0;
+    MOTOR_RIGHT_B = 0;
+
+    // PWM OFF
+    CCPR1L = 0;
+    CCPR2L = 0;
+
+    __delay_ms(50);
+}
+
+// ============================================================
+//                 SONAR READ DISTANCE
+// ============================================================
+uint16_t sonar_read_cm(void) {
+    uint16_t time = 0;
+
+    // Send 10µs trigger pulse
+    SONAR_TRIG = 0;
+    __delay_us(2);
+    SONAR_TRIG = 1;
+    __delay_us(10);
+    SONAR_TRIG = 0;
+
+    // Wait for echo HIGH (timeout protection)
+    uint16_t timeout = 30000;
+    while (!SONAR_ECHO && timeout--) __delay_us(1);
+    if (timeout == 0) return 0;  // No response
+
+    // Measure HIGH duration
+    while (SONAR_ECHO) {
+        time++;
+        __delay_us(1);
+        if (time > 30000) break; // safety
+    }
+
+    // Convert to cm
+    return time / 58;   // standard HC-SR04 conversion
+}
+
+// ============================================================
+//  INTERRUPT SERVICE ROUTINE  (Mode Cycle Button on RB0/INT0)
+// ============================================================
+void __interrupt() ISR(void) {
+    if (INT0IF) {
+        __delay_ms(20);                 // Button debounce
+        if (PORTBbits.RB0 == 0) {
+            robot_mode = (robot_mode + 1) % 3;
+            // Reset autonomous state on every mode transition
+            node_count = 0;
+            last_node  = -1;
+            stop();                     // Safety stop during transition
+        }
+        INT0IF = 0;
+    }
+}
+
+// ============================================================
+//  MAIN
+// ============================================================
+void main(void) {
+    // -- Oscillator: INTOSC @ 8 MHz --
+    OSCCON = 0x72;
+
+    // -- Disable ADC on all pins (use as digital I/O) --
+    ADCON1 = 0x0F;
+
+    // -- Port Directions --
+    TRISA = 0xFF;           // All sensors = inputs
+    
+    TRISBbits.TRISB0 = 1;   // Button
+    TRISBbits.TRISB1 = 0;   // COLOR_S3
+    TRISBbits.TRISB2 = 1;   // COLOR_IN
+    TRISBbits.TRISB3 = 0;   // Servo
+    TRISBbits.TRISB4 = 0;   // COLOR_S2
+    TRISBbits.TRISB5 = 1;   // SONAR_ECHO
+    
+    TRISCbits.TRISC0 = 0;   // SONAR_TRIG
+    TRISCbits.TRISC1 = 0;   // CCP2 PWM
+    TRISCbits.TRISC2 = 0;   // CCP1 PWM
+
+    TRISD = 0x00;           // LEDs + motors = outputs
+
+    // -- Enable INT0 interrupt --
+    INTCONbits.GIE   = 0;
+    INTCONbits.INT0IE = 0;
+    
+    
+    // --------------------------------------------------------
+    //  MAIN LOOP
+    // --------------------------------------------------------
+    
+    // -- Power-On Self Test --
+    //run_power_on_self_test();  
+    //robot_mode = 0;
+    
+    motor_init_safe();
+    
+    set_servo_angle(0);
+    __delay_ms(300);
+    set_servo_angle(90);
+    __delay_ms(300);
+    set_servo_angle(0);
+    
+    pwm_init();
+    
+    
+    while (1) {
+        switch (robot_mode) {
+
+            // ----------------------------------------------------
+            case 0: // STANDBY Mode
+            // ----------------------------------------------------
+                LED_SYS_OK = 1; LED_BUSY = 0; LED_ERROR = 0;
+                
+                case1_change_counter += 1;
+                
+                // Mirror center sensor on BUSY LED for manual alignment aid 
+                static uint16_t blinkTimer = 0;
+                
+                if (!S_CENTER) {
+                    if (blinkTimer >= 200) {   // 200 ms toggle ? 2.5 Hz blink
+                        LED_BUSY = !LED_BUSY;
+                        blinkTimer = 0;
+                    }
+                    __delay_ms(1);
+                    blinkTimer++;
+                } else {
+                    LED_BUSY = 0;
+                    blinkTimer = 0;
+                }
+                
+                //Change Mode
+                if(case1_change_counter == 10000){
+                    robot_mode = (robot_mode + 1) % 3;
+                
+                    node_count = 0;       // Reset autonomous state on every mode transition
+                    last_node  = -1;
+                    stop();               // Safety stop during transition
+                }
+                
+                break;
+
+            // ----------------------------------------------------
+            case 1: // DIAGNOSTIC DRIVE
+            // ----------------------------------------------------
+                LED_SYS_OK = 0; LED_BUSY = 1; LED_ERROR = 0;
+                // Short forward burst then stop ? confirms motor wiring
+                
+                __delay_ms(500);
+                
+                forward();       __delay_ms(2000);
+                stop();          __delay_ms(1000);
+                soft_left();     __delay_ms(2000);
+                stop();          __delay_ms(1000);
+                soft_right();    __delay_ms(2000);
+                stop();          __delay_ms(1000);
+                hard_left();     __delay_ms(2000);
+                stop();          __delay_ms(1000);
+                hard_right();    __delay_ms(2000);
+                stop();          __delay_ms(1000);
+                
+                //Change Mode
+                robot_mode = (robot_mode + 1) % 3;
+                
+                node_count = 0;       // Reset autonomous state on every mode transition
+                last_node  = -1;
+                stop();               // Safety stop during transition
+                
+                break;
+
+            // ----------------------------------------------------
+            case 2: // FULL AUTONOMOUS  (NERC 2026 Theme)
+            // ----------------------------------------------------
+                LED_SYS_OK = 0; LED_BUSY = 0; LED_ERROR = 1;
+                
+                
+                //Sonar sensor code
+                uint16_t dist = sonar_read_cm();
+                
+                if (dist > 0 && dist < Sonar_Distance) {   // obstacle within 15 cm
+                    stop();
+
+                    // Simple avoidance behavior
+                    hard_left();
+                    __delay_ms(400);
+
+                    forward();
+                    __delay_ms(200);
+
+                        break;  // skip rest of loop
+                }                
+                
+                line_follow();
+                
+                break;
+        }
+    }   
+}
