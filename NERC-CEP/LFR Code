@@ -93,7 +93,7 @@ int Sonar_Distance = 5;
 //  180 = ~70% speed  (good starting point for line following)
 //  128 = 50% speed
 //  80  = ~30% speed  (very slow, use if still overshooting)
-#define MOTOR_SPEED     180
+#define MOTOR_SPEED     100
 
 // ============================================================
 //  PWM INITIALISATION
@@ -213,86 +213,109 @@ uint8_t is_blue_slot(void) {
 //  LINE FOLLOWING WITH LINE-LOSS RECOVERY
 // ============================================================
 
-// -2 = far left
-// -1 = left
-//  0 = centered
-// +1 = right
-// +2 = far right
-
 volatile int8_t last_error = 0;
 
+// Pre-computed action lookup table
+typedef enum {
+    ACTION_FORWARD,
+    ACTION_SOFT_LEFT,
+    ACTION_SOFT_RIGHT,
+    ACTION_HARD_LEFT,
+    ACTION_HARD_RIGHT,
+    ACTION_RECOVERY
+} Action_t;
+
+// Lookup table for all 32 possible sensor combinations
+const Action_t action_table[32] = {
+    /* 0b00000 */ ACTION_RECOVERY,      // All off - line lost
+    /* 0b00001 */ ACTION_HARD_LEFT,     // S1 only
+    /* 0b00010 */ ACTION_HARD_LEFT,     // S2 only
+    /* 0b00011 */ ACTION_HARD_LEFT,     // S1+S2
+    /* 0b00100 */ ACTION_FORWARD,       // S3 only (perfect)
+    /* 0b00101 */ ACTION_HARD_LEFT,     // S1+S3
+    /* 0b00110 */ ACTION_FORWARD,       // S2+S3 (slight left)
+    /* 0b00111 */ ACTION_HARD_LEFT,     // S1+S2+S3
+    /* 0b01000 */ ACTION_HARD_RIGHT,    // S4 only
+    /* 0b01001 */ ACTION_FORWARD,       // S1+S4 (unlikely)
+    /* 0b01010 */ ACTION_FORWARD,       // S2+S4 (unlikely)
+    /* 0b01011 */ ACTION_HARD_LEFT,     // S1+S2+S4
+    /* 0b01100 */ ACTION_FORWARD,       // S3+S4 (slight right)
+    /* 0b01101 */ ACTION_HARD_LEFT,     // S1+S3+S4
+    /* 0b01110 */ ACTION_FORWARD,       // S2+S3+S4 (straight)
+    /* 0b01111 */ ACTION_HARD_LEFT,     // Missing only S5
+    /* 0b10000 */ ACTION_HARD_RIGHT,    // S5 only
+    /* 0b10001 */ ACTION_FORWARD,       // S1+S5 (junction-ish)
+    /* 0b10010 */ ACTION_HARD_LEFT,    // S2+S5
+    /* 0b10011 */ ACTION_HARD_LEFT,     // S1+S2+S5
+    /* 0b10100 */ ACTION_HARD_RIGHT,    // S3+S5
+    /* 0b10101 */ ACTION_FORWARD,       // S1+S3+S5
+    /* 0b10110 */ ACTION_HARD_RIGHT,    // S2+S3+S5
+    /* 0b10111 */ ACTION_HARD_LEFT,     // Missing only S4
+    /* 0b11000 */ ACTION_HARD_RIGHT,    // S4+S5
+    /* 0b11001 */ ACTION_HARD_RIGHT,    // S1+S4+S5
+    /* 0b11010 */ ACTION_HARD_RIGHT,    // S2+S4+S5
+    /* 0b11011 */ ACTION_HARD_RIGHT,    // Missing only S3
+    /* 0b11100 */ ACTION_HARD_RIGHT,    // S3+S4+S5
+    /* 0b11101 */ ACTION_HARD_RIGHT,    // Missing only S2
+    /* 0b11110 */ ACTION_HARD_RIGHT,    // Missing only S1
+    /* 0b11111 */ ACTION_FORWARD        // All on - junction
+};
+
 void line_follow(void) {
-
-    // ACTIVE LOW -> invert
-    uint8_t s1 = !S_FAR_LEFT;
-    uint8_t s2 = !S_LEFT;
-    uint8_t s3 = !S_CENTER;
-    uint8_t s4 = !S_RIGHT;
-    uint8_t s5 = !S_FAR_RIGHT;
-
-    // CENTER
-    if (s3) {
-        forward();
-        __delay_ms(5);
-        last_error = 0;
-    }
-
-    // SLIGHT LEFT
-    else if (s2 && !s1) {
-        soft_left();
-        __delay_ms(7);
-
-        forward();
-        __delay_ms(2);
-
-        last_error = -1;
-    }
-
-    // SLIGHT RIGHT
-    else if (s4 && !s5) {
-        soft_right();
-        __delay_ms(7);
-
-        forward();
-        __delay_ms(2);
-
-        last_error = 1;
-    }
-
-    // HARD LEFT
-    else if (s1) {
-        hard_left();
-        __delay_ms(9);
-
-        last_error = -2;
-    }
-
-    // HARD RIGHT
-    else if (s5) {
-        hard_right();
-        __delay_ms(9);
-
-        last_error = 2;
-    }
-
-    // LINE LOST
-    else {
-
-        forward();
-        __delay_ms(5);
-        
-//        if (last_error < 0) {
-//            hard_left();
-//            __delay_ms(5);
-//        }
-//        else if (last_error > 0) {
-//            hard_right();
-//            __delay_ms(5);
-//        }
-//        else {
-//            forward();
-//            __delay_ms(5);
-//        }
+    // Single read - single index
+    uint8_t pattern = ((!PORTAbits.RA0) << 4) |  // S_FAR_LEFT
+                      ((!PORTAbits.RA1) << 3) |  // S_LEFT
+                      ((!PORTAbits.RA2) << 2) |  // S_CENTER
+                      ((!PORTAbits.RA3) << 1) |  // S_RIGHT
+                      ((!PORTAbits.RA5) << 0);    // S_FAR_RIGHT
+    
+    // Execute based on lookup table
+    switch(action_table[pattern]) {
+        case ACTION_FORWARD:
+            forward();
+            __delay_ms(2);
+            last_error = 0;
+            break;
+            
+        case ACTION_SOFT_LEFT:
+            soft_left();
+            __delay_ms(5);
+            forward();
+            __delay_ms(1);
+            last_error = -1;
+            break;
+            
+        case ACTION_SOFT_RIGHT:
+            soft_right();
+            __delay_ms(5);
+            forward();
+            __delay_ms(1);
+            last_error = 1;
+            break;
+            
+        case ACTION_HARD_LEFT:
+            hard_left();
+            __delay_ms(7);
+            last_error = -2;
+            break;
+            
+        case ACTION_HARD_RIGHT:
+            hard_right();
+            __delay_ms(7);
+            last_error = 2;
+            break;
+            
+        case ACTION_RECOVERY:
+            forward();
+            __delay_ms(3);
+            if (last_error < 0) {
+                hard_left();
+                __delay_ms(8);
+            } else {
+                hard_right();
+                __delay_ms(8);
+            }
+            break;
     }
 }
 
@@ -367,10 +390,7 @@ uint8_t detect_junction(void) {
 
     // Detect wide intersection
     if (
-        (s1 && s2 && s3) ||
-        (s3 && s4 && s5) ||
-        (s2 && s3 && s4) ||
-        (s1 && s5)
+        (s1 && s2 && s3 && s4 && s5)
        )
     {
         return 1;
@@ -546,14 +566,15 @@ void main(void) {
                 LED_SYS_OK = 0; LED_BUSY = 0; LED_ERROR = 1;
                 
                 
-//                //Sonar sensor code
-//                uint16_t dist = sonar_read_cm();
-//                
+                //Sonar sensor code
+                uint16_t dist = sonar_read_cm();
+                
 //                if (dist > 0 && dist < Sonar_Distance) {   // obstacle within 15 cm
 //                    stop();
-//
+//                    
 //                    // Simple avoidance behavior
-//                    hard_left();
+//                    //hard_left();
+//                    stop();
 //                    __delay_ms(400);
 //
 //                    forward();
@@ -573,30 +594,24 @@ void main(void) {
                         junction_lock = 1;
 
                         // small forward settle
-                        forward();
-                        __delay_ms(200);
+                        stop();
+                        __delay_ms(100);        
 
                         // THIRD JUNCTION -> TURN
-                        if (junction_count == 3) {
-
-                            hard_right();
-
-                            // turn until center reacquires line
-                            while (S_CENTER) {
-                                __delay_ms(1);
-                            }
-
-                            forward();
-                            __delay_ms(100);
-                        }
+//                        if (junction_count == 3) {
+//
+//                            turn_right();
+//
+//                            forward();
+//                            __delay_ms(100);
+//                        }
                     }
                 }
                 else {
                     junction_lock = 0;
                 }                
                 
-                line_follow();
-                
+                line_follow();   
                 break;
         }
     }   
