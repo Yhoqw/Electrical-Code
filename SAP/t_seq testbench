@@ -1,0 +1,15 @@
+module t_seq;
+  reg clk, clr;
+  wire [2:0] T;
+
+  sequence_counter sc(.sc_out(T), .clk(clk), .clr(clr));
+
+  always #5 clk = ~clk;
+
+  initial begin
+    $monitor("time=%0t clk=%b clr=%b T=%b", $time, clk, clr, T);
+    clk = 0; clr = 1;
+    #10 clr = 0;
+    #100 $finish;
+  end
+endmodule
