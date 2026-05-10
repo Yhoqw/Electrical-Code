@@ -1,0 +1,39 @@
+module t_processor;
+    reg        en;
+    reg        clk;
+    reg        reg_clr;
+    wire [7:0] bus_out;
+    wire [7:0] output_reg;
+    wire [7:0] Acc;
+    wire [2:0] SC_cycle;
+
+    processor uut(
+        .en(en),
+        .clk(clk),
+        .reg_clr(reg_clr),
+        .bus_out(bus_out),
+        .output_reg(output_reg),
+        .from_Acc(Acc),
+        .SC_cycle(SC_cycle)
+    );
+
+    always #5 clk = ~clk;
+
+    initial begin
+
+	$monitor("time=%0t clk=%b reg_clr=%b SC_cycle=%b bus_out=%h Acc=%h", $time, clk, reg_clr, SC_cycle, bus_out, Acc);
+
+        // Initialize Inputs
+        en      = 1;
+        clk     = 0;
+        reg_clr = 1;
+
+        // Add stimulus here
+        #100;
+        reg_clr = 0;
+        #300;
+        reg_clr = 1;
+        #10;
+        reg_clr = 0;
+    end
+endmodule
