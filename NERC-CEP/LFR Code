@@ -240,7 +240,7 @@ void line_follow(void) {
     // SLIGHT LEFT
     else if (s2 && !s1) {
         soft_left();
-        __delay_ms(5);
+        __delay_ms(7);
 
         forward();
         __delay_ms(2);
@@ -251,7 +251,7 @@ void line_follow(void) {
     // SLIGHT RIGHT
     else if (s4 && !s5) {
         soft_right();
-        __delay_ms(5);
+        __delay_ms(7);
 
         forward();
         __delay_ms(2);
@@ -262,7 +262,7 @@ void line_follow(void) {
     // HARD LEFT
     else if (s1) {
         hard_left();
-        __delay_ms(8);
+        __delay_ms(9);
 
         last_error = -2;
     }
@@ -270,7 +270,7 @@ void line_follow(void) {
     // HARD RIGHT
     else if (s5) {
         hard_right();
-        __delay_ms(8);
+        __delay_ms(9);
 
         last_error = 2;
     }
@@ -278,20 +278,24 @@ void line_follow(void) {
     // LINE LOST
     else {
 
-        if (last_error < 0) {
-            hard_left();
-            __delay_ms(5);
-        }
-        else if (last_error > 0) {
-            hard_right();
-            __delay_ms(5);
-        }
-        else {
-            forward();
-            __delay_ms(5);
-        }
+        forward();
+        __delay_ms(5);
+        
+//        if (last_error < 0) {
+//            hard_left();
+//            __delay_ms(5);
+//        }
+//        else if (last_error > 0) {
+//            hard_right();
+//            __delay_ms(5);
+//        }
+//        else {
+//            forward();
+//            __delay_ms(5);
+//        }
     }
 }
+
 void align_on_node(void) {
     // Move forward slightly to center robot
     forward();
@@ -403,6 +407,7 @@ uint16_t sonar_read_cm(void) {
     // Convert to cm
     return time / 58;   // standard HC-SR04 conversion
 }
+
 
 // ============================================================
 //  INTERRUPT SERVICE ROUTINE  (Mode Cycle Button on RB0/INT0)
