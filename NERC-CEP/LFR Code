@@ -1,14 +1,19 @@
 /*
  * PROJECT: NERC/CEP 2026 Autonomous Robot
- * VERSION: 3.0 (Integration Build)
+ * VERSION: 3.8 (No-Centre Alternating Correction)
  * AUTHOR: Yazdan Ali Khan (2024665)
  * TARGET: PIC18F4550 @ 8MHz
  *
- * ARCHITECTURE: Interrupt-driven state machine (main.c v2.0 philosophy)
- * AUTONOMOUS LOGIC: Node-based navigation with colour-sorted pallet deployment
+ * LINE FOLLOW PHILOSOPHY (this version):
+ *   S3 (centre) is IGNORED for steering decisions.
+ *   The robot reads only S1/S2 (left) and S4/S5 (right).
+ *   If the line is more on the left  → steer LEFT
+ *   If the line is more on the right → steer RIGHT
+ *   If perfectly ambiguous           → use last_error to decide
+ *   This creates a constant oscillating micro-correction that
+ *   tracks tight curves more aggressively than centre-biased logic.
  */
 
-// Configuration Bits
 #pragma config FOSC   = INTOSC_HS
 #pragma config PLLDIV = 1
 #pragma config CPUDIV = OSC1_PLL2
@@ -38,118 +43,91 @@
 //  PIN ARCHITECTURE
 // ============================================================
 
-// -- Diagnostics / Mode LEDs --
-#define LED_SYS_OK      LATDbits.LATD0  // Green  : Mode 0 ? Standby Mode LED
-#define LED_BUSY        LATDbits.LATD1  // White  : Mode 1 ? Debug Mode LED
-#define LED_ERROR       LATDbits.LATD2  // Red(Also White) : Mode 2 ? Fully Autonomous  Mode LED
+#define LED_SYS_OK      LATDbits.LATD0
+#define LED_BUSY        LATDbits.LATD1
+#define LED_ERROR       LATDbits.LATD2
 
-// -- Motor Driver (L298N / L293D) --
-#define MOTOR_LEFT_F    LATDbits.LATD4  // IN1
-#define MOTOR_LEFT_B    LATDbits.LATD5  // IN2
-#define MOTOR_RIGHT_F   LATDbits.LATD6  // IN3
-#define MOTOR_RIGHT_B   LATDbits.LATD7  // IN4
+#define MOTOR_LEFT_F    LATDbits.LATD4
+#define MOTOR_LEFT_B    LATDbits.LATD5
+#define MOTOR_RIGHT_F   LATDbits.LATD6
+#define MOTOR_RIGHT_B   LATDbits.LATD7
 
-// -- Servo (Pallet Deployment) --
-#define SERVO_PWM       LATBbits.LATB3  // CCP2 / software PWM
+#define SERVO_PWM       LATBbits.LATB3
 
-// -- Colour Sensor (TCS3200 or single digital output) --
-//    Convention: COLOR_IN == 1 ? BLUE slot, 0 ? RED slot
 #define COLOR_S2        LATBbits.LATB4
 #define COLOR_S3        LATBbits.LATB1
 #define COLOR_IN        PORTBbits.RB2
 
-// -- Line Sensors (Active Low: 0 = Black Line detected) --
 #define SENSORS_PORT    PORTA
 #define S_FAR_LEFT      PORTAbits.RA0   // S1
 #define S_LEFT          PORTAbits.RA1   // S2
-#define S_CENTER        PORTAbits.RA2   // S3
+#define S_CENTER        PORTAbits.RA2   // S3 — not used for steering
 #define S_RIGHT         PORTAbits.RA3   // S4
 #define S_FAR_RIGHT     PORTAbits.RA5   // S5
 
-// -- Ultrasonic Sensor (HC-SR04) --
-#define SONAR_TRIG LATCbits.LATC0
-#define SONAR_ECHO  PORTBbits.RB5
+#define SONAR_TRIG      LATCbits.LATC0
+#define SONAR_ECHO      PORTBbits.RB5
 
-// -- Push-Button (Mode Cycle) --
-// RB0 / INT0 ? external pull-up required
+// ============================================================
+//  SPEED SETTING
+// ============================================================
+#define MOTOR_SPEED     128
+#define FAST_SPEED    120
+#define SLOW_SPEED    95
+#define TURN_SPEED    140
 
 // ============================================================
 //  GLOBAL STATE
 // ============================================================
-volatile uint8_t robot_mode  = 2;   // 0 = Standby, 1 = Diagnostic , 2 = Autonomous
-volatile int     node_count  = 0;   // Nodes detected during autonomous run
-volatile int     last_node   = -1;  // Debounce: ignore re-triggers on same node
-volatile uint8_t junction_lock = 0;
-volatile uint8_t junction_count = 0;
+volatile uint8_t robot_mode          = 2;
+volatile int     node_count          = 0;
+volatile int     last_node           = -1;
+volatile uint8_t junction_lock       = 0;
+volatile uint8_t junction_count      = 0;
+volatile int     case1_change_counter = 0;
+volatile int8_t  last_error          = 0;  // -1 = last turned left, +1 = last turned right
 
-volatile int case1_change_counter = 0;
-float Version = 3.1;
-int Sonar_Distance = 5;
-
-// ============================================================
-//  SPEED SETTING  <-- only value you need to tune (0-255)
-// ============================================================
-//  255 = full speed
-//  180 = ~70% speed  (good starting point for line following)
-//  128 = 50% speed
-//  80  = ~30% speed  (very slow, use if still overshooting)
-#define MOTOR_SPEED     100
+float Version        = 3.9;
+int   Sonar_Distance = 5;
 
 // ============================================================
-//  PWM INITIALISATION
+//  PWM INIT
 // ============================================================
-/*
- * Timer2 drives both CCP1 and CCP2.
- * PR2 = 199, prescaler = 4 → ~2.5 kHz PWM frequency.
- * Duty cycle set via CCPR1L/CCPR2L (0-255 maps to 0-100%).
- */
 void pwm_init(void) {
-    // 1. Set CCP pins as outputs
-    TRISCbits.TRISC2 = 0;   // CCP1 output
-    TRISCbits.TRISC1 = 0;   // CCP2 output
- 
-    // 2. Set PWM period via PR2
-    PR2 = 199;
- 
-    // 3. Configure CCP1 in PWM mode
-    CCP1CON = 0x0C;         // PWM mode, LSBs of duty = 00
- 
-    // 4. Configure CCP2 in PWM mode
+    TRISCbits.TRISC2 = 0;
+    TRISCbits.TRISC1 = 0;
+    PR2     = 199;
+    CCP1CON = 0x0C;
     CCP2CON = 0x0C;
- 
-    // 5. Set initial duty cycle (both motors same speed)
-    CCPR1L = MOTOR_SPEED;
-    CCPR2L = MOTOR_SPEED;
- 
-    // 6. Start Timer2 (prescaler = 4)
-    T2CON = 0x05;           // Timer2 ON, prescaler = 4
+    CCPR1L  = MOTOR_SPEED;
+    CCPR2L  = MOTOR_SPEED;
+    T2CON   = 0x05;
 }
 
-/* Software PWM pulse ? generates one servo pulse of 'us' microseconds */
+// ============================================================
+//  SERVO
+// ============================================================
 static void _servo_pulse(uint16_t us) {
     SERVO_PWM = 1;
-    // XC8 __delay_us() requires a compile-time constant; use a loop instead
     while (us--) { __delay_us(1); }
     SERVO_PWM = 0;
 }
 
-/* Move servo to angle (0?180°) by sending ~40 pulses @ 20 ms period */
 void set_servo_angle(uint8_t angle) {
+    uint8_t i;
     uint16_t pulse_us = 1000u + ((uint16_t)angle * 1000u / 180u);
-    for (uint8_t i = 0; i < 40; i++) {
+    for (i = 0; i < 40; i++) {
         _servo_pulse(pulse_us);
         __delay_ms(20);
     }
 }
 
 // ============================================================
-//  MOTOR CONTROL  (raw pin set)
+//  MOTOR CONTROL
 // ============================================================
-
-//  SPEED CONTROL  (call anytime to change speed on the fly)
 void set_speed(uint8_t left, uint8_t right) {
-    CCPR2L = left;          // CCP2 / RC1 = left motor
-    CCPR1L = right;         // CCP1 / RC2 = right motor
+    CCPR2L = left;
+    CCPR1L = right;
 }
 
 void drive(int8_t left, int8_t right) {
@@ -158,229 +136,43 @@ void drive(int8_t left, int8_t right) {
     MOTOR_RIGHT_F = (right > 0);
     MOTOR_RIGHT_B = (right < 0);
 }
- 
-static void forward(void)    { set_speed(MOTOR_SPEED, MOTOR_SPEED); drive( 1,  1); }
-static void stop(void)       { set_speed(0, 0);                     drive( 0,  0); }
-static void soft_left(void)  { set_speed(0, MOTOR_SPEED);           drive( 0,  1); }
-static void soft_right(void) { set_speed(MOTOR_SPEED, 0);           drive( 1,  0); }
-static void hard_left(void)  { set_speed(MOTOR_SPEED, MOTOR_SPEED); drive(-1,  1); }
-static void hard_right(void) { set_speed(MOTOR_SPEED, MOTOR_SPEED); drive( 1, -1); }
 
-// ============================================================
-//  SELF-DIAGNOSTIC (Power-On Self Test)
-/* Tests All 3 LEDs to see if they are responsive when first startup 
- * Tests Servo Motors and range
- * Check if IR Sesnors are operational
- */
-void run_power_on_self_test(void) {
-    // 1. LED Chase ? confirms all three LEDs are functional
-    LED_SYS_OK = 1; __delay_ms(300);
-    LED_BUSY   = 1; __delay_ms(200);
-    LED_ERROR  = 1; __delay_ms(200);
-    
-    LATD &= 0b00000111;   // Clear only LED bits (D0-D2), preserve motor bits
-
-    // 2. Servo Range Test
-    set_servo_angle(0);
-    __delay_ms(300);
-    set_servo_angle(90);
-    __delay_ms(300);
-    set_servo_angle(0);
-
-    // 3. Sensor Bus Check ? all lines read high (open circuit / no sensors) light up Green LED
-    if (SENSORS_PORT == 0xFF) {
-        LED_ERROR = 1;  // Amber + Red = sensor fault; operator must inspect
-    }
+static void forward(void) {
+    set_speed(FAST_SPEED, FAST_SPEED);
+    drive(1, 1);
 }
 
-// ============================================================
-//  COLOUR DETECTION
-// ============================================================
-/*
- * Returns 1 if the sensor reports BLUE, 0 if RED (or unknown).
- * The TCS3200 S2=0/S3=1 selects the blue photo-diode filter.
- * A full implementation would measure output frequency via timer;
- * here we read the raw digital output after a settle delay.
- */
-uint8_t is_blue_slot(void) {
-    COLOR_S2 = 0;
-    COLOR_S3 = 1;
-    __delay_ms(15);         // Allow TCS3200 output to settle
-    return COLOR_IN;        // 1 = Blue frequency dominant
+static void soft_left(void) {
+    set_speed(SLOW_SPEED, FAST_SPEED);
+    drive(1, 1);
 }
 
-// ============================================================
-//  LINE FOLLOWING WITH LINE-LOSS RECOVERY
-// ============================================================
-
-volatile int8_t last_error = 0;
-
-// Pre-computed action lookup table
-typedef enum {
-    ACTION_FORWARD,
-    ACTION_SOFT_LEFT,
-    ACTION_SOFT_RIGHT,
-    ACTION_HARD_LEFT,
-    ACTION_HARD_RIGHT,
-    ACTION_RECOVERY
-} Action_t;
-
-// Lookup table for all 32 possible sensor combinations
-const Action_t action_table[32] = {
-    /* 0b00000 */ ACTION_RECOVERY,      // All off - line lost
-    /* 0b00001 */ ACTION_HARD_LEFT,     // S1 only
-    /* 0b00010 */ ACTION_HARD_LEFT,     // S2 only
-    /* 0b00011 */ ACTION_HARD_LEFT,     // S1+S2
-    /* 0b00100 */ ACTION_FORWARD,       // S3 only (perfect)
-    /* 0b00101 */ ACTION_HARD_LEFT,     // S1+S3
-    /* 0b00110 */ ACTION_FORWARD,       // S2+S3 (slight left)
-    /* 0b00111 */ ACTION_HARD_LEFT,     // S1+S2+S3
-    /* 0b01000 */ ACTION_HARD_RIGHT,    // S4 only
-    /* 0b01001 */ ACTION_FORWARD,       // S1+S4 (unlikely)
-    /* 0b01010 */ ACTION_FORWARD,       // S2+S4 (unlikely)
-    /* 0b01011 */ ACTION_HARD_LEFT,     // S1+S2+S4
-    /* 0b01100 */ ACTION_FORWARD,       // S3+S4 (slight right)
-    /* 0b01101 */ ACTION_HARD_LEFT,     // S1+S3+S4
-    /* 0b01110 */ ACTION_FORWARD,       // S2+S3+S4 (straight)
-    /* 0b01111 */ ACTION_HARD_LEFT,     // Missing only S5
-    /* 0b10000 */ ACTION_HARD_RIGHT,    // S5 only
-    /* 0b10001 */ ACTION_FORWARD,       // S1+S5 (junction-ish)
-    /* 0b10010 */ ACTION_HARD_LEFT,    // S2+S5
-    /* 0b10011 */ ACTION_HARD_LEFT,     // S1+S2+S5
-    /* 0b10100 */ ACTION_HARD_RIGHT,    // S3+S5
-    /* 0b10101 */ ACTION_FORWARD,       // S1+S3+S5
-    /* 0b10110 */ ACTION_HARD_RIGHT,    // S2+S3+S5
-    /* 0b10111 */ ACTION_HARD_LEFT,     // Missing only S4
-    /* 0b11000 */ ACTION_HARD_RIGHT,    // S4+S5
-    /* 0b11001 */ ACTION_HARD_RIGHT,    // S1+S4+S5
-    /* 0b11010 */ ACTION_HARD_RIGHT,    // S2+S4+S5
-    /* 0b11011 */ ACTION_HARD_RIGHT,    // Missing only S3
-    /* 0b11100 */ ACTION_HARD_RIGHT,    // S3+S4+S5
-    /* 0b11101 */ ACTION_HARD_RIGHT,    // Missing only S2
-    /* 0b11110 */ ACTION_HARD_RIGHT,    // Missing only S1
-    /* 0b11111 */ ACTION_FORWARD        // All on - junction
-};
-
-void line_follow(void) {
-    // Single read - single index
-    uint8_t pattern = ((!PORTAbits.RA0) << 4) |  // S_FAR_LEFT
-                      ((!PORTAbits.RA1) << 3) |  // S_LEFT
-                      ((!PORTAbits.RA2) << 2) |  // S_CENTER
-                      ((!PORTAbits.RA3) << 1) |  // S_RIGHT
-                      ((!PORTAbits.RA5) << 0);    // S_FAR_RIGHT
-    
-    // Execute based on lookup table
-    switch(action_table[pattern]) {
-        case ACTION_FORWARD:
-            forward();
-            __delay_ms(2);
-            last_error = 0;
-            break;
-            
-        case ACTION_SOFT_LEFT:
-            soft_left();
-            __delay_ms(5);
-            forward();
-            __delay_ms(1);
-            last_error = -1;
-            break;
-            
-        case ACTION_SOFT_RIGHT:
-            soft_right();
-            __delay_ms(5);
-            forward();
-            __delay_ms(1);
-            last_error = 1;
-            break;
-            
-        case ACTION_HARD_LEFT:
-            hard_left();
-            __delay_ms(7);
-            last_error = -2;
-            break;
-            
-        case ACTION_HARD_RIGHT:
-            hard_right();
-            __delay_ms(7);
-            last_error = 2;
-            break;
-            
-        case ACTION_RECOVERY:
-            forward();
-            __delay_ms(3);
-            if (last_error < 0) {
-                hard_left();
-                __delay_ms(8);
-            } else {
-                hard_right();
-                __delay_ms(8);
-            }
-            break;
-    }
+static void soft_right(void) {
+    set_speed(FAST_SPEED, SLOW_SPEED);
+    drive(1, 1);
 }
 
-void align_on_node(void) {
-    // Move forward slightly to center robot
-    forward();
-    __delay_ms(150);
-    stop();
+static void hard_left(void) {
+    set_speed(TURN_SPEED, TURN_SPEED);
+    drive(-1, 1);
 }
 
-// ============================================================
-//  PALLET DEPLOYMENT  (color-sorted)
-// ============================================================
-void demo_placement(void) {
-    stop();
-    __delay_ms(200);
-
-    if (is_blue_slot()) {
-        // BLUE slot ? full drop (90°)
-        set_servo_angle(90);
-        LED_SYS_OK = 1; LED_BUSY = 0;
-    } else {
-        // RED slot ? reject / partial swing (45°)
-        set_servo_angle(45);
-        LED_SYS_OK = 0; LED_BUSY = 1;
-    }
-
-    __delay_ms(400);
-    set_servo_angle(0);     // Return arm to home
-    __delay_ms(300);
-
-    LED_SYS_OK = 0; LED_BUSY = 0;
+static void hard_right(void) {
+    set_speed(TURN_SPEED, TURN_SPEED);
+    drive(1, -1);
 }
 
-// ============================================================
-//  TIMED TURN HELPERS
-// ============================================================
-void turn_right(void) {
-    hard_right();
-    while (S_CENTER) { }   // wait until line reacquired
-    stop();
-}
+static void stop(void)       { set_speed(0, 0); drive( 0,  0); }
 
-void turn_left(void) {
-    hard_left();
-    while (S_CENTER) { }   // wait until line reacquired
-    stop();
-}
 
 void motor_init_safe(void) {
-
-    // Directions OFF
-    MOTOR_LEFT_F  = 0;
-    MOTOR_LEFT_B  = 0;
-    MOTOR_RIGHT_F = 0;
-    MOTOR_RIGHT_B = 0;
-
-    // PWM OFF
-    CCPR1L = 0;
-    CCPR2L = 0;
-
+    MOTOR_LEFT_F  = 0; MOTOR_LEFT_B  = 0;
+    MOTOR_RIGHT_F = 0; MOTOR_RIGHT_B = 0;
+    CCPR1L = 0; CCPR2L = 0;
     __delay_ms(50);
 }
 
-uint8_t detect_junction(void) {
+void line_follow(void) {
 
     uint8_t s1 = !S_FAR_LEFT;
     uint8_t s2 = !S_LEFT;
@@ -388,59 +180,218 @@ uint8_t detect_junction(void) {
     uint8_t s4 = !S_RIGHT;
     uint8_t s5 = !S_FAR_RIGHT;
 
-    // Detect wide intersection
-    if (
-        (s1 && s2 && s3 && s4 && s5)
-       )
-    {
-        return 1;
+    // ========================================================
+    // FULL LINE LOSS RECOVERY
+    // ========================================================
+
+    if (!s1 && !s2 && !s3 && !s4 && !s5) {
+
+        if (last_error <= 0) {
+
+            while (1) {
+
+                hard_left();
+
+                if (!S_FAR_LEFT || !S_LEFT ||
+                    !S_CENTER   || !S_RIGHT ||
+                    !S_FAR_RIGHT) {
+
+                    last_error = -1;
+                    return;
+                }
+            }
+
+        } else {
+
+            while (1) {
+
+                hard_right();
+
+                if (!S_FAR_LEFT || !S_LEFT ||
+                    !S_CENTER   || !S_RIGHT ||
+                    !S_FAR_RIGHT) {
+
+                    last_error = 1;
+                    return;
+                }
+            }
+        }
     }
 
+    // ========================================================
+    // SHARP CORNER RECOVERY
+    // ========================================================
+
+    if (s1 && !s5) {
+
+        hard_left();
+        __delay_ms(2);
+
+        last_error = -1;
+        return;
+    }
+
+    if (s5 && !s1) {
+
+        hard_right();
+        __delay_ms(2);
+
+        last_error = 1;
+        return;
+    }
+
+    // ========================================================
+    // PRIMARY TRACKING
+    // S2 and S4 dominate behavior
+    // ========================================================
+
+    if (s2 && !s4) {
+
+        soft_left();
+        __delay_ms(1);
+
+        last_error = -1;
+    }
+
+    else if (s4 && !s2) {
+
+        soft_right();
+        __delay_ms(1);
+
+        last_error = 1;
+    }
+
+    // ========================================================
+    // CENTERED / AMBIGUOUS
+    // ========================================================
+
+    else {
+
+        // Tiny oscillation only
+
+        if (last_error <= 0) {
+
+            soft_left();
+            __delay_ms(1);
+
+        } else {
+
+            soft_right();
+            __delay_ms(1);
+        }
+    }
+}
+
+
+// ============================================================
+//  JUNCTION DETECTION  (uses all 5 sensors including S3)
+// ============================================================
+uint8_t detect_junction(void) {
+    if (!S_FAR_LEFT && !S_LEFT && !S_CENTER && !S_RIGHT && !S_FAR_RIGHT) {
+        __delay_ms(70);
+        if (!S_FAR_LEFT && !S_LEFT && !S_CENTER && !S_RIGHT && !S_FAR_RIGHT)
+            return 1;
+    }
     return 0;
 }
 
 // ============================================================
-//                 SONAR READ DISTANCE
+//  COLOUR DETECTION
+// ============================================================
+uint8_t is_blue_slot(void) {
+    COLOR_S2 = 0;
+    COLOR_S3 = 1;
+    __delay_ms(15);
+    return COLOR_IN;
+}
+
+// ============================================================
+//  PALLET DEPLOYMENT
+// ============================================================
+void demo_placement(void) {
+    stop();
+    __delay_ms(200);
+
+    if (is_blue_slot()) {
+        set_servo_angle(90);
+        LED_SYS_OK = 1; LED_BUSY = 0;
+    } else {
+        set_servo_angle(45);
+        LED_SYS_OK = 0; LED_BUSY = 1;
+    }
+
+    __delay_ms(400);
+    set_servo_angle(0);
+    __delay_ms(300);
+
+    LED_SYS_OK = 0; LED_BUSY = 0;
+}
+
+// ============================================================
+//  TURN HELPERS
+// ============================================================
+void turn_right(void) {
+    hard_right();
+    while (S_CENTER) { }
+    stop();
+}
+
+void turn_left(void) {
+    hard_left();
+    while (S_CENTER) { }
+    stop();
+}
+
+// ============================================================
+//  SONAR
 // ============================================================
 uint16_t sonar_read_cm(void) {
     uint16_t time = 0;
+    uint16_t timeout;
 
-    // Send 10µs trigger pulse
-    SONAR_TRIG = 0;
-    __delay_us(2);
-    SONAR_TRIG = 1;
-    __delay_us(10);
+    SONAR_TRIG = 0; __delay_us(2);
+    SONAR_TRIG = 1; __delay_us(10);
     SONAR_TRIG = 0;
 
-    // Wait for echo HIGH (timeout protection)
-    uint16_t timeout = 30000;
+    timeout = 30000;
     while (!SONAR_ECHO && timeout--) __delay_us(1);
-    if (timeout == 0) return 0;  // No response
+    if (timeout == 0) return 0;
 
-    // Measure HIGH duration
     while (SONAR_ECHO) {
         time++;
         __delay_us(1);
-        if (time > 30000) break; // safety
+        if (time > 30000) break;
     }
-
-    // Convert to cm
-    return time / 58;   // standard HC-SR04 conversion
+    return time / 58;
 }
 
+// ============================================================
+//  POWER-ON SELF TEST
+// ============================================================
+void run_power_on_self_test(void) {
+    LED_SYS_OK = 1; __delay_ms(300);
+    LED_BUSY   = 1; __delay_ms(200);
+    LED_ERROR  = 1; __delay_ms(200);
+    LATD &= 0b00000111;
+
+    set_servo_angle(0);  __delay_ms(300);
+    set_servo_angle(90); __delay_ms(300);
+    set_servo_angle(0);
+
+    if (SENSORS_PORT == 0xFF) { LED_ERROR = 1; }
+}
 
 // ============================================================
-//  INTERRUPT SERVICE ROUTINE  (Mode Cycle Button on RB0/INT0)
+//  ISR
 // ============================================================
 void __interrupt() ISR(void) {
     if (INT0IF) {
-        __delay_ms(20);                 // Button debounce
+        __delay_ms(20);
         if (PORTBbits.RB0 == 0) {
             robot_mode = (robot_mode + 1) % 3;
-            // Reset autonomous state on every mode transition
             node_count = 0;
             last_node  = -1;
-            stop();                     // Safety stop during transition
+            stop();
         }
         INT0IF = 0;
     }
@@ -450,169 +401,112 @@ void __interrupt() ISR(void) {
 //  MAIN
 // ============================================================
 void main(void) {
-    // -- Oscillator: INTOSC @ 8 MHz --
     OSCCON = 0x72;
-
-    // -- Disable ADC on all pins (use as digital I/O) --
     ADCON1 = 0x0F;
 
-    // -- Port Directions --
-    TRISA = 0xFF;           // All sensors = inputs
-    
-    TRISBbits.TRISB0 = 1;   // Button
-    TRISBbits.TRISB1 = 0;   // COLOR_S3
-    TRISBbits.TRISB2 = 1;   // COLOR_IN
-    TRISBbits.TRISB3 = 0;   // Servo
-    TRISBbits.TRISB4 = 0;   // COLOR_S2
-    TRISBbits.TRISB5 = 1;   // SONAR_ECHO
-    
-    TRISCbits.TRISC0 = 0;   // SONAR_TRIG
-    TRISCbits.TRISC1 = 0;   // CCP2 PWM
-    TRISCbits.TRISC2 = 0;   // CCP1 PWM
+    TRISA = 0xFF;
 
-    TRISD = 0x00;           // LEDs + motors = outputs
+    TRISBbits.TRISB0 = 1;
+    TRISBbits.TRISB1 = 0;
+    TRISBbits.TRISB2 = 1;
+    TRISBbits.TRISB3 = 0;
+    TRISBbits.TRISB4 = 0;
+    TRISBbits.TRISB5 = 1;
 
-    // -- Enable INT0 interrupt --
-    INTCONbits.GIE   = 0;
-    INTCONbits.INT0IE = 0;
-    
-    
-    // --------------------------------------------------------
-    //  MAIN LOOP
-    // --------------------------------------------------------
-    
-    // -- Power-On Self Test --
-    //run_power_on_self_test();  
-    //robot_mode = 0;
-    
+    TRISCbits.TRISC0 = 0;
+    TRISCbits.TRISC1 = 0;
+    TRISCbits.TRISC2 = 0;
+
+    TRISD = 0x00;
+
     motor_init_safe();
-    
+
+    set_servo_angle(0);  __delay_ms(300);
+    set_servo_angle(90); __delay_ms(300);
     set_servo_angle(0);
-    __delay_ms(300);
-    set_servo_angle(90);
-    __delay_ms(300);
-    set_servo_angle(0);
-    
+
     pwm_init();
-    
-    
+
+    INTCONbits.GIE    = 0;
+    INTCONbits.INT0IE = 0;
+
     while (1) {
         switch (robot_mode) {
 
-            // ----------------------------------------------------
-            case 0: // STANDBY Mode
-            // ----------------------------------------------------
+            // ------------------------------------------------
+            case 0: // STANDBY
+            // ------------------------------------------------
                 LED_SYS_OK = 1; LED_BUSY = 0; LED_ERROR = 0;
-                
                 case1_change_counter += 1;
-                
-                // Mirror center sensor on BUSY LED for manual alignment aid 
-                static uint16_t blinkTimer = 0;
-                
-                if (!S_CENTER) {
-                    if (blinkTimer >= 200) {   // 200 ms toggle ? 2.5 Hz blink
-                        LED_BUSY = !LED_BUSY;
+                {
+                    static uint16_t blinkTimer = 0;
+                    if (!S_CENTER) {
+                        if (blinkTimer >= 200) {
+                            LED_BUSY = !LED_BUSY;
+                            blinkTimer = 0;
+                        }
+                        __delay_ms(1);
+                        blinkTimer++;
+                    } else {
+                        LED_BUSY = 0;
                         blinkTimer = 0;
                     }
-                    __delay_ms(1);
-                    blinkTimer++;
-                } else {
-                    LED_BUSY = 0;
-                    blinkTimer = 0;
                 }
-                
-                //Change Mode
-                if(case1_change_counter == 10000){
+                if (case1_change_counter == 10000) {
                     robot_mode = (robot_mode + 1) % 3;
-                
-                    node_count = 0;       // Reset autonomous state on every mode transition
+                    node_count = 0;
                     last_node  = -1;
-                    stop();               // Safety stop during transition
+                    stop();
                 }
-                
                 break;
 
-            // ----------------------------------------------------
+            // ------------------------------------------------
             case 1: // DIAGNOSTIC DRIVE
-            // ----------------------------------------------------
+            // ------------------------------------------------
                 LED_SYS_OK = 0; LED_BUSY = 1; LED_ERROR = 0;
-                // Short forward burst then stop ? confirms motor wiring
-                
                 __delay_ms(500);
-                
-                forward();       __delay_ms(2000);
-                stop();          __delay_ms(1000);
-                soft_left();     __delay_ms(2000);
-                stop();          __delay_ms(1000);
-                soft_right();    __delay_ms(2000);
-                stop();          __delay_ms(1000);
-                hard_left();     __delay_ms(2000);
-                stop();          __delay_ms(1000);
-                hard_right();    __delay_ms(2000);
-                stop();          __delay_ms(1000);
-                
-                //Change Mode
+                forward();    __delay_ms(2000);
+                stop();       __delay_ms(1000);
+                soft_left();  __delay_ms(2000);
+                stop();       __delay_ms(1000);
+                soft_right(); __delay_ms(2000);
+                stop();       __delay_ms(1000);
+                hard_left();  __delay_ms(2000);
+                stop();       __delay_ms(1000);
+                hard_right(); __delay_ms(2000);
+                stop();       __delay_ms(1000);
                 robot_mode = (robot_mode + 1) % 3;
-                
-                node_count = 0;       // Reset autonomous state on every mode transition
+                node_count = 0;
                 last_node  = -1;
-                stop();               // Safety stop during transition
-                
+                stop();
                 break;
 
-            // ----------------------------------------------------
-            case 2: // FULL AUTONOMOUS  (NERC 2026 Theme)
-            // ----------------------------------------------------
+            // ------------------------------------------------
+            case 2: // FULL AUTONOMOUS
+            // ------------------------------------------------
                 LED_SYS_OK = 0; LED_BUSY = 0; LED_ERROR = 1;
-                
-                
-                //Sonar sensor code
-                uint16_t dist = sonar_read_cm();
-                
-//                if (dist > 0 && dist < Sonar_Distance) {   // obstacle within 15 cm
-//                    stop();
-//                    
-//                    // Simple avoidance behavior
-//                    //hard_left();
-//                    stop();
-//                    __delay_ms(400);
-//
-//                    forward();
-//                    __delay_ms(200);
-//
-//                        break;  // skip rest of loop
-//                }                
-                
-                // ------------------------------------------------
-                // JUNCTION DETECTION
-                // ------------------------------------------------
+
+                {
+                    uint16_t dist = sonar_read_cm();
+                    (void)dist;
+                }
+
                 if (detect_junction()) {
-
                     if (!junction_lock) {
-
                         junction_count++;
                         junction_lock = 1;
-
-                        // small forward settle
                         stop();
-                        __delay_ms(100);        
-
-                        // THIRD JUNCTION -> TURN
-//                        if (junction_count == 3) {
-//
-//                            turn_right();
-//
-//                            forward();
-//                            __delay_ms(100);
-//                        }
+                        __delay_ms(100);
+                        demo_placement();
+                        forward();
+                        __delay_ms(300);
                     }
-                }
-                else {
+                } else {
                     junction_lock = 0;
-                }                
-                
-                line_follow();   
+                }
+
+                line_follow();
                 break;
         }
-    }   
+    }
 }
