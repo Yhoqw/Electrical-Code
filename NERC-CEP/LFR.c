@@ -69,7 +69,7 @@ static void _servo_pulse(uint16_t us) {
     SERVO_PWM = 0;
 }
 
-/* Move servo to angle (0?180°) by sending ~40 pulses @ 20 ms period */
+/* Move servo to angle (0?180Â°) by sending ~40 pulses @ 20 ms period */
 void set_servo_angle(uint8_t angle) {
     uint16_t pulse_us = 1000u + ((uint16_t)angle * 1000u / 180u);
     for (uint8_t i = 0; i < 40; i++) {
@@ -185,11 +185,11 @@ void demo_placement(void) {
     __delay_ms(200);
 
     if (is_blue_slot()) {
-        // BLUE slot ? full drop (90°)
+        // BLUE slot ? full drop (90Â°)
         set_servo_angle(90);
         LED_SYS_OK = 1; LED_BUSY = 0;
     } else {
-        // RED slot ? reject / partial swing (45°)
+        // RED slot ? reject / partial swing (45Â°)
         set_servo_angle(45);
         LED_SYS_OK = 0; LED_BUSY = 1;
     }
