@@ -1,0 +1,81 @@
+// --- CONSTANTS & CALIBRATION VALUES ---
+const float V_IN = 5.0;           // Arduino operating voltage (5V)
+const float R_PULLDOWN = 10000.0; // Value of your pulldown resistor in Ohms (e.g., 10k ohms)
+const float VOL_PER_DROP = 0.05;  // Average volume of one water droplet in milliliters (mL)
+
+// --- VARIABLES ---
+unsigned long dropCount = 0;      // Counter for the number of droplets detected
+
+void setup() {
+  pinMode(A0, INPUT);             // Read voltage from the water sensor circuit
+  Serial.begin(9600);             // Initialize the Serial Monitor
+  
+  // Print table headers for clean viewing
+  Serial.println("Voltage(V) \t Current(mA) \t Resistance(Ohm) \t Total Vol(mL \t Drop Count)");
+  Serial.println("---------------------------------------------------------------------");
+}
+
+void loop() {
+  // 1. Read raw ADC value (0 to 1023)
+  int rawADC = analogRead(A0);
+  
+  // 2. Calculate the voltage drop across the pulldown resistor
+  float vOut = (rawADC / 1023.0) * V_IN;
+  
+  // 3. Formula for Current (I = V / R) passing through the circuit
+  // Multiplying by 1000 converts Amperes (A) to Milliamperes (mA) for easier reading
+  float current_mA = (vOut / R_PULLDOWN) * 1000.0;
+  
+  // 4. Formula for Water Resistance (R_sensor = (V_in * R_pulldown / V_out) - R_pulldown)
+  float waterResistance = 0.0;
+  if (vOut > 0.05) { // Prevent division by zero when sensor is bone dry
+    waterResistance = ((V_IN * R_PULLDOWN) / vOut) - R_PULLDOWN;
+  } else {
+    waterResistance = -1.0; // Represents an open circuit / infinite resistance (Dry)
+  }
+  
+// --- ADD THESE VARIABLES AT THE VERY TOP OF YOUR SKETCH (ABOVE SETUP) ---
+bool isWet = false;             // Tracks if the sensor was already wet on the last loop
+unsigned long lastDropTime = 0; // Stores the last time a drop was confirmed (in milliseconds)
+const int DEBOUNCE_DELAY = 500; // Cooldown period (500ms) to ignore ripples from the same drop
+
+// --- REPLACE STEP 5 INSIDE YOUR LOOP() WITH THIS ---
+// Check 1: Is the sensor reading above the threshold?
+// Check 2: Was it dry on the previous loop? (Prevents continuous counting)
+// Check 3: Has enough time passed since the last drop? (Prevents ripple errors)
+if (rawADC > 200 && !isWet && (millis() - lastDropTime > DEBOUNCE_DELAY)) { 
+  dropCount++;                  // Count exactly ONE new droplet
+  isWet = true;                 // Lock the state so it won't count again until it dries
+  lastDropTime = millis();      // Record the time of this impact
+}
+
+// Reset the lock only when the sensor completely dries up again
+if (rawADC <= 150) {            // Using 150 (slightly lower than 200) prevents stuttering
+  isWet = false;
+}
+  
+  // 6. Formula for Total Volume (V = Total Drops * Volume per Drop)
+  float totalVolume_mL = dropCount * VOL_PER_DROP;
+
+  // --- PRINT RESULTS TO SERIAL MONITOR ---
+  Serial.print(vOut, 2);
+  Serial.print(" V \t\t ");
+  
+  Serial.print(current_mA, 4);
+  Serial.print(" mA \t\t ");
+  
+  if (waterResistance == -1.0) {
+    Serial.print("INF (DRY) \t\t ");
+  } else {
+    Serial.print(waterResistance, 1);
+    Serial.print(" Ohm \t\t ");
+  }
+  
+  Serial.print(totalVolume_mL, 2);
+  Serial.println(" mL");
+
+  Serial.print(dropCount, 2);
+  Serial.println(" Drops"); 
+
+  delay(500); // Wait half a second before updating the data
+}
