@@ -1,0 +1,151 @@
+// Enable Pins
+const int ENA = 5;
+const int ENB = 6;
+
+// Left Motor
+const int IN1 = 9;
+const int IN2 = 8;
+
+// Right Motor
+const int IN3 = 11;
+const int IN4 = 10;
+
+// Sensor Pins
+const int leftSensor = 14;  
+const int rightSensor = 15; 
+const int midSensor = 16;
+
+const int SPEED = 255;   // 0-255
+
+void setup()
+{
+    pinMode(ENA, OUTPUT);
+    pinMode(ENB, OUTPUT);
+
+    pinMode(IN1, OUTPUT);
+    pinMode(IN2, OUTPUT);
+
+    pinMode(IN3, OUTPUT);
+    pinMode(IN4, OUTPUT);
+
+    pinMode(leftSensor, INPUT);
+    pinMode(rightSensor, INPUT);
+    pinMode(midSensor, INPUT);
+
+    stopMotors();
+}
+
+void forward(){
+
+    analogWrite(ENA, SPEED);
+    analogWrite(ENB, SPEED);
+
+    digitalWrite(IN1, LOW);
+    digitalWrite(IN2, HIGH);
+
+    digitalWrite(IN3, LOW);
+    digitalWrite(IN4, HIGH);
+}
+
+void reverse(){
+
+    analogWrite(ENA, SPEED);
+    analogWrite(ENB, SPEED);
+
+    digitalWrite(IN1, HIGH);
+    digitalWrite(IN2, LOW);
+
+    digitalWrite(IN3, HIGH);
+    digitalWrite(IN4, LOW);
+}
+
+void left(){
+
+    // Left motor stopped
+    analogWrite(ENA, 0);
+
+    // Right motor running
+    analogWrite(ENB, SPEED);
+
+    digitalWrite(IN3, HIGH);
+    digitalWrite(IN4, LOW);
+}
+
+void right(){
+
+    // Right motor stopped
+    analogWrite(ENB, 0);
+
+    // Left motor running
+    analogWrite(ENA, SPEED);
+
+    digitalWrite(IN1, HIGH);
+    digitalWrite(IN2, LOW);
+}
+
+void stopMotors(){
+
+    analogWrite(ENA, 0);
+    analogWrite(ENB, 0);
+
+    digitalWrite(IN1, LOW);
+    digitalWrite(IN2, LOW);
+
+    digitalWrite(IN3, LOW);
+    digitalWrite(IN4, LOW);
+}
+
+void loop()
+{
+  int leftState  = digitalRead(leftSensor);
+  int midState   = digitalRead(midSensor);
+  int rightState = digitalRead(rightSensor);
+
+  // Convert LOW/HIGH into a 3-bit pattern
+  // LOW (line) -> 0
+  // HIGH (background) -> 1
+  int sensorValue = (leftState << 2) | (midState << 1) | rightState;
+
+  switch (sensorValue)
+  {
+    // 000 : L M R all on line
+    case 0b000:
+        forward();
+        break;
+
+    // 001 : Right + Middle on line
+    case 0b001:
+        right();
+        break;
+
+    // 010 : Middle only
+    case 0b010:
+        forward();
+        break;
+
+    // 011 : Right only
+    case 0b011:
+        right();
+        break;
+
+    // 100 : Left + Middle on line
+    case 0b100:
+        left();
+        break;
+
+    // 101 : Left and Right on line
+    case 0b101:
+        forward();     // Junction or wide line
+        break;
+
+    // 110 : Left only
+    case 0b110:
+        left();
+        break;
+
+    // 111 : No sensor sees line
+    case 0b111:
+        stopMotors();  // or reverse()/search routine
+        break;
+  }
+}
